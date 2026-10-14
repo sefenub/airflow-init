@@ -1,0 +1,156 @@
+# Airflow 3 on a single VM: LocalExecutor + Postgres.
+#
+# No Celery/Redis: tasks run as subprocesses of the scheduler container, which is
+# the right fit for one box. Move to CeleryExecutor only when you add a second VM.
+#
+# Setup:
+#   make build              # prints the image reference for AIRFLOW_IMAGE_NAME
+#   cp .env.example .env    # then fill in every value
+#   docker compose up -d
+#
+# The image and all secrets are required; compose refuses to start if one is missing.
+---
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-airflow-common: &airflow-common
+  # Built from the Dockerfile via the Makefile. Add Python packages there, not here.
+  image: ${AIRFLOW_IMAGE_NAME:?set AIRFLOW_IMAGE_NAME in .env (see make image)}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Max task instances running at once across the whole VM. Size to CPU/RAM.
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW_PARALLELISM:-8}
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/airflow
+    # Encrypts connection passwords and variables in the metadata DB. Losing or
+    # changing it makes every stored connection unreadable, so back it up.
+    # Generate with:
+    #   python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+    # These two must be identical in every Airflow container, so they cannot be
+    # left for Airflow to autogenerate. Generate each with: openssl rand -hex 32
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW__API__SECRET_KEY:?set AIRFLOW__API__SECRET_KEY in .env}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:?set AIRFLOW__API_AUTH__JWT_SECRET in .env}
+    # Where task processes reach the API server from inside the compose network.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+    # Host staging directory for files in transit, seen as /data in tasks.
+    # Must be writable by AIRFLOW_UID.
+    - ${DATA_DIR:-./data}:/data
+  user: "${AIRFLOW_UID:-50000}:0"
+  restart: unless-stopped
+  logging: *default-logging
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: airflow
+    volumes:
+      # Host directory, so the database survives `docker compose down -v` and a
+      # project rename, and can sit on a data disk. Owned by the container's
+      # postgres user (uid 999) after first start. Not a backup: use pg_dump.
+      - ${POSTGRES_DATA_DIR:-./pgdata}:/var/lib/postgresql/data
+    # Not published to the host; only reachable on the compose network.
+    shm_size: 256mb
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow", "-d", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # One-shot: creates/owns the bind-mounted dirs, migrates the metadata DB and
+  # creates the admin user. Runs on every `up`, and is a no-op once done.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?set _AIRFLOW_WWW_USER_PASSWORD in .env}
+    user: "0:0"
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      # Loopback only by default. Put a TLS reverse proxy in front, or reach it
+      # over an SSH tunnel, rather than exposing 8080 to the network.
+      - "${AIRFLOW_BIND:-127.0.0.1}:${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    # Tasks run inside this container, so give them time to finish on shutdown.
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Runs deferrable operators/sensors (e.g. waiting on a file to land) without
+  # holding one of the PARALLELISM slots.
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
