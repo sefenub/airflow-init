@@ -1,0 +1,7 @@
+# Keep runtime state and secrets out of the build context. pgdata/ is not
+# readable by the build user, so the build fails without this.
+.env
+pgdata/
+data/
+logs/
+dist/
