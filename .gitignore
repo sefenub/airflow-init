@@ -4,3 +4,4 @@ data/
 pgdata/
 dist/
 __pycache__/
+certs/

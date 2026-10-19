@@ -35,7 +35,17 @@ x-airflow-common: &airflow-common
     AIRFLOW__API__SECRET_KEY: ${AIRFLOW__API__SECRET_KEY:?set AIRFLOW__API__SECRET_KEY in .env}
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:?set AIRFLOW__API_AUTH__JWT_SECRET in .env}
     # Where task processes reach the API server from inside the compose network.
+    # Its default is {BASE_URL}/execution/, so keep it explicit: tasks must not
+    # go out through the proxy's public name and internal CA.
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Public URL behind the proxy, used for redirects and links. A bare host,
+    # no path: Airflow under a sub-path breaks in many small ways.
+    AIRFLOW__API__BASE_URL: ${AIRFLOW_BASE_URL:?set AIRFLOW_BASE_URL in .env}
+    # FAB login builds its own redirects; without this it sends users to
+    # http:// after login. Trusts one hop of X-Forwarded-* (nginx).
+    AIRFLOW__FAB__ENABLE_PROXY_FIX: 'true'
+    # The git-sync symlink to the current commit (see the git-sync service).
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags/repo
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
   volumes:
@@ -105,7 +115,13 @@ services:
 
   airflow-apiserver:
     <<: *airflow-common
-    command: api-server
+    command: ["api-server", "--proxy-headers"]
+    environment:
+      <<: *airflow-common-env
+      # uvicorn only trusts X-Forwarded-* from 127.0.0.1 by default, and nginx
+      # connects from another container. Safe because 8080 is not exposed beyond
+      # loopback; narrow this if AIRFLOW_BIND is ever opened up.
+      FORWARDED_ALLOW_IPS: '*'
     ports:
       # Loopback only by default. Put a TLS reverse proxy in front, or reach it
       # over an SSH tunnel, rather than exposing 8080 to the network.
@@ -136,6 +152,10 @@ services:
   airflow-dag-processor:
     <<: *airflow-common
     command: dag-processor
+    depends_on:
+      <<: *airflow-common-depends-on
+      git-sync:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
       interval: 30s
@@ -154,3 +174,48 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+
+  # Pulls the DAG repo into ./dags every GIT_SYNC_PERIOD. ./dags is owned by
+  # git-sync: anything else in it is deleted on start. It holds a .worktrees
+  # checkout plus a `repo` symlink to the current commit, which is why
+  # DAGS_FOLDER points at dags/repo (scanning dags/ would load every DAG twice).
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.7.1
+    environment:
+      GITSYNC_REPO: ${GIT_SYNC_REPO:?set GIT_SYNC_REPO in .env}
+      GITSYNC_REF: ${GIT_SYNC_REF:-main}
+      GITSYNC_ROOT: /git
+      GITSYNC_LINK: repo
+      GITSYNC_PERIOD: ${GIT_SYNC_PERIOD:-60s}
+      GITSYNC_MAX_FAILURES: -1
+      # Returns 5xx until the first sync completes; used by the healthcheck.
+      GITSYNC_HTTP_BIND: 127.0.0.1:8081
+    volumes:
+      - ./dags:/git
+    # Same owner airflow-init gives ./dags, so its chown and git-sync agree.
+    user: "${AIRFLOW_UID:-50000}:0"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1m
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  proxy:
+    image: nginx:1.28
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./proxy/airflow.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      airflow-apiserver:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
